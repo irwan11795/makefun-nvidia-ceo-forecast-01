@@ -1,87 +1,53 @@
-# Polymarket "Next CEO of NVIDIA?" forecaster v3 (make.fun polymarket-nvidia-ceo-forecast-01).
+# Polymarket "Next CEO of NVIDIA?" forecaster v4 (make.fun polymarket-nvidia-ceo-forecast-01).
 #
-# v3 rebuilds the entry on the top-10 reference architecture (a friend's
-# grind, shared with us as a design reference -- prose only, this code is
-# written from scratch here): a normal fan around a sum-reverting median,
-# with per-market realised volatility, horizon-bucket calibration, a
-# staleness shrink and an activity-tier widening, plus a skew correction
-# on the upper-middle quantile.
+# v4 starts from our submitted v3 (sum-reverting normal fan, RMS vol
+# calibrated x0.47 -- see GRIND-V3.md) and adds four new knobs, all
+# defaulting to v3 behaviour, to test structural ideas v3 never tried:
 #
-# Design (all constants below are the reference v6 values):
+# (a) vol_mode: "rms" (v3), "meanabs" (the reference's estimator,
+#     normal-consistent sqrt(pi/2)*E|d|), or "blend" -- a mix of the two
+#     calibrated sigmas, weight vol_blend_w on meanabs. RMS wins on quiet
+#     practice cases; meanabs is jump-robust; a blend may dominate both.
+# (b) stale_blocks_active: if True, a stale market does NOT get the
+#     activity-tier widening (staleness overrides activity).
+# (c) active_window: if set (minutes), the activity tier counts price
+#     changes only over the last N minutes instead of the whole case.
+# (d) tau_gap_k: if > 0, the sum-reversion time constant becomes
+#     tau / (1 + k*|target - x|) -- markets far from their normalised
+#     share glide faster.
 #
-# 1. MEDIAN = persistence + sum-reversion. The 24 candidates are mutually
-#    exclusive, so the Yes prices should sum to ~1; each market's median
-#    glides toward its normalised share x_i/S (S = sum of the last prices
-#    of all markets in the case):
-#        centre_i(h) = x_i + (1 - exp(-h/TAU)) * (x_i/S - x_i),  TAU = 180
-#    The glide applies to the WHOLE fan (every quantile is centred on
-#    centre_i(h)), not to the median alone.
+# WHAT SHIPPED (this file): tau 210, sigma_scale 0.50, window weights
+# 0.55/0.30/0.15 -- centre of a flat plateau (neighbours tau 200-220,
+# scale 0.49-0.51, weights .55/.3/.15-.6/.3/.1 all similar), NOT the
+# argmin. Verified practice loss (our grade.py): mean 0.248323
+# (p00 0.382963, p01 0.297720, p02 0.326009, p03 0.246519, p04 0.186512,
+# p05 0.104664; wins 4/6 vs v3). Out-of-sample: 27 pseudo-cases 0.914960
+# (v3: 0.933348), Nov-12 subset (15) 0.380100 (v3: 0.381742), Nov-11
+# subset (12, volatile) 3.254973 (v3: 3.346622). LOO: beats v3 on 5/6
+# subsets; the p03-dropped subset is +0.000578 worse (the practice gain
+# is concentrated in p03 -- see GRIND-V4.md for the honest caveats).
+# The v4 knobs below were all tested and REJECTED (blend, stale-block,
+# active window, gap-scaled tau, glide skew); they stay in the file at
+# their inert defaults so the experiments are reproducible.
 #
-# 2. SIGMA = realised vol per market, from 1-minute diffs. Diffs are
-#    winsorised at +-0.05, then the root-mean-square over trailing windows
-#    of 120 / 360 / 1440 minutes is blended 0.4 / 0.4 / 0.2. The blend is
-#    floored at 0.0002 and capped at 0.012, then scaled by 0.47 (see the
-#    "WHAT SHIPPED" note below for why). Fan half-width at horizon h:
-#        width_j(h) = z_j * sigma * sqrt(h)          (z = normal quantiles)
+# Base design (v3 = reference v6 + 2 measured changes):
+# 1. MEDIAN = persistence + sum-reversion: centre_i(h) = x_i +
+#    (1 - exp(-h/TAU)) * (x_i/S - x_i), TAU = 210, S = sum of the last
+#    prices of all markets. The glide applies to the WHOLE fan.
+# 2. SIGMA = realised vol per market, from 1-minute diffs winsorised at
+#    +-0.05, blended over trailing windows 120/360/1440 min (0.55/0.30/0.15),
+#    floored at 0.0002, capped at 0.012, scaled by 0.50. Fan half-width:
+#    width_j(h) = z_j * sigma * sqrt(h).
+# 3. HORIZON BUCKETS multiply the fan width: 1.0 (h 1-30), 0.85 (31-120),
+#    0.85 (121-240).
+# 4. STALENESS: last price unchanged >=120 min -> sigma x 0.5.
+# 5. ACTIVITY TIER: top tertile by change count -> sigma x 1.15.
+# 6. QUANTILE OFFSETS (additive): (0, 0, 0, -0.04, +0.005).
 #
-# 3. HORIZON BUCKETS multiply the fan width: 1.0 for h 1-30, 0.85 for
-#    h 31-120, 0.85 for h 121-240. The fan is too wide at long horizons;
-#    short horizons stay full because jumps live there.
-#
-# 4. STALENESS: a market whose last price has not changed for >=120
-#    minutes gets sigma x 0.5 (a dead market stays dead).
-#
-# 5. ACTIVITY TIER: the top tertile of markets by number of price changes
-#    within the case gets sigma x 1.15. Active markets' moves cluster and
-#    persist, so the fan is too narrow for them, not too wide.
-#
-# 6. QUANTILE OFFSETS (additive, after the width): (q05, q25, q50, q75,
-#    q95) = (0, 0, 0, -0.04, +0.005). Realised prices skew below the fan
-#    (q75 coverage was 0.841 vs 0.75 nominal), so the skew correction sits
-#    on q75 -- NOT on the median (a median offset was rejected outright;
-#    the centre is already right).
-#
-# Reference v6 practice loss (their true grader, same numbers as ours):
-# mean 0.252411 (p00 0.384117, p01 0.301470, p02 0.333913, p03 0.254442,
-# p04 0.189746, p05 0.105501; median error 0.748344, coverage90 0.913184).
-# Our v1 (empirical fan, persistence median) is 0.285720 and our v2
-# (empirical fan + price kernel + pooled blend) is 0.275400 on the same
-# grader; this v3 is a different family, not a tweak of either.
-#
-# WHAT SHIPPED (this file) vs the reference v6 -- two changes, both
-# measured on our grader and validated out-of-sample (see GRIND-V3.md):
-#
-# (a) SIGMA ESTIMATOR + CALIBRATION. The reference's prose says "realised
-#     vol from 1-minute diffs" without naming the estimator. My first build
-#     used RMS and landed at 0.290782 with cov90 0.9843 (fan far too wide)
-#     while the median error matched the reference EXACTLY (0.748344), so
-#     the centre was right and only the fan scale was wrong. Diagnosis: for
-#     this steppy series RMS is dominated by rare jumps. Switching sigma to
-#     the mean-absolute-diff estimator (normal-consistent, sqrt(pi/2)*E|d|)
-#     reproduces the reference v6 almost exactly: 0.252634 (per-case within
-#     0.0023, p04/p05/med_err exact). The SHIPPED estimator is RMS with a
-#     global 0.47 calibration instead: practice 0.248893, and it ALSO wins
-#     on 27 unseen pseudo-cases (0.933348 vs base 0.964917) and on the 15
-#     final-like Nov-12 checkpoints (0.381742 vs 0.387870), with a positive
-#     leave-one-out margin on every 5-case subset. The 0.47 sits mid-valley
-#     (practice 0.2488 at 0.45, 0.2489 at 0.47, 0.2490 at 0.48, 0.2494 at
-#     0.50 -- flat), not at a sharp argmin.
-# (b) SIGMA FLOOR 0.0002 instead of 0.0004 (OAT winner, 4/6 cases, and the
-#     0.0002-0.0003 valley is flat; 0.0008 is much worse).
-# Everything else is the reference v6 unchanged (tau 180, buckets,
-# staleness, activity tier, offsets).
-#
-# TESTED AND REJECTED on this family (details in GRIND-V3.md): pooled-sigma
-# blend for short-history markets (practice +0.007, rejected); price-kernel
-# sigma bw 0.075/0.10 (pseudo worse); tau 120 (practice -0.0005 but pseudo
-# +0.049 -- a practice mirage, rejected); sigma cap 0.008 (practice gain
-# concentrated in p03 alone, 1/6 wins; on the RMS champion it HURTS);
-# winsor 0.08; bucket (1.0, 0.85, 0.75); q75 offsets -0.02/-0.03/-0.05/-0.06;
-# q95 offset 0/+0.01; stale 0.4/0.6/off and thresholds 60/180; active
-# 1.0/1.10/1.25; window-weight blends. The reference's own rejected levers
-# (sub-diffusive beta, symmetric tail inflation, logit space, drift/momentum,
-# bounce-reversal, jump-filtered sigma, burst window, per-quantile exponents)
-# were NOT re-tested, per the reference.
+# v3 verified practice loss (our grade.py): mean 0.248893
+# (p00 0.378211, p01 0.298991, p02 0.323896, p03 0.252330, p04 0.187394,
+# p05 0.105682; med_err 0.748344, cov90 0.9430). Out-of-sample: 27
+# pseudo-cases 0.933348, Nov-12 subset (15) 0.381742, LOO all positive.
 #
 # Pure Python 3.13 standard library, deterministic, offline.
 # Reads every <id>.in in the input directory (MAKEFUN_INPUT_DIR or /input)
@@ -100,10 +66,16 @@ QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95]
 # Standard-normal quantiles for QUANTILES (rounded to 9 dp; symmetric).
 Z = [-1.644853627, -0.67448975, 0.0, 0.67448975, 1.644853627]
 
-# --- reference v6 parameters (tunable via PARAMS for experiments) ---
+# --- v4 SHIPPED parameters (centre of the plateau, NOT the argmin) ---
+# tau 210 (v3: 180), sigma_scale 0.50 (v3: 0.47), window weights
+# 0.55/0.30/0.15 (v3: 0.4/0.4/0.2). The three changes are complementary:
+# slower glide + wider fan insure the volatile regime, the recent-weighted
+# vol sharpens the quiet regime; each alone fails (tau/scale alone:
+# practice +0.0008, 0/6 wins; weights alone: pseudo +0.0030), together
+# they improve practice AND all out-of-sample sets (see GRIND-V4.md).
 PARAMS = {
-    "tau": 180.0,            # sum-reversion glide time constant (minutes)
-    "win_weights": ((120, 0.4), (360, 0.4), (1440, 0.2)),  # vol windows
+    "tau": 210.0,            # sum-reversion glide time constant (minutes)
+    "win_weights": ((120, 0.55), (360, 0.3), (1440, 0.15)),  # vol windows
     "winsor": 0.05,          # per-diff winsor cap
     "sigma_floor": 0.0002,
     "sigma_cap": 0.012,
@@ -112,7 +84,15 @@ PARAMS = {
     "stale_mult": 0.5,
     "active_mult": 1.15,     # top-tertile activity widening
     "offsets": (0.0, 0.0, 0.0, -0.04, 0.005),
-    "sigma_scale": 0.47,     # global calibration on sigma (see header note)
+    "sigma_scale": 0.50,     # global calibration on RMS sigma
+    # --- v4 knobs (defaults reproduce v3 exactly; all tested, see GRIND-V4.md) ---
+    "vol_mode": "rms",       # "rms" | "meanabs" | "blend"
+    "meanabs_scale": 1.0,    # calibration on the meanabs estimator
+    "vol_blend_w": 0.5,      # weight on meanabs when vol_mode == "blend"
+    "stale_blocks_active": False,  # stale markets skip active widening
+    "active_window": None,   # minutes of recent history for activity count
+    "tau_gap_k": 0.0,        # >0: tau_eff = tau / (1 + k*|target - x|)
+    "glide_skew": 0.0,       # >0: fan widens in the glide direction, narrows opposite
 }
 
 
@@ -126,23 +106,50 @@ def _diffs(prices):
     return [prices[i + 1] - prices[i] for i in range(len(prices) - 1)]
 
 
-def _sigma(prices, p):
-    """Blended realised vol: RMS of winsorised 1-minute diffs over trailing
-    windows of 120 / 360 / 1440 minutes, blended 0.4 / 0.4 / 0.2, floored
-    at sigma_floor and capped at sigma_cap, then scaled by sigma_scale.
-    """
-    diffs = _diffs(prices)
-    w = p["winsor"]
-    win = [max(-w, min(w, d)) for d in diffs]
-    if not win:
-        return p["sigma_floor"]
+def _sigma_rms(win, p):
+    """RMS of winsorised diffs over trailing windows, blended."""
     sig = 0.0
     for minutes, weight in p["win_weights"]:
         seg = win[-minutes:] if len(win) > minutes else win
         n = len(seg)
         var = sum(d * d for d in seg) / n
         sig += weight * math.sqrt(var)
-    return min(max(sig, p["sigma_floor"]), p["sigma_cap"]) * p["sigma_scale"]
+    return sig
+
+
+def _sigma_meanabs(win, p):
+    """Normal-consistent mean-absolute-diff estimator: sqrt(pi/2)*E|d|,
+    blended over the same trailing windows."""
+    sig = 0.0
+    for minutes, weight in p["win_weights"]:
+        seg = win[-minutes:] if len(win) > minutes else win
+        n = len(seg)
+        sig += weight * math.sqrt(math.pi / 2.0) * sum(abs(d) for d in seg) / n
+    return sig
+
+
+def _sigma(prices, p):
+    """Blended realised vol, floored/capped BEFORE scaling per vol_mode
+    (v3 applies floor/cap first, then the scale -- the effective floor is
+    floor*scale)."""
+    diffs = _diffs(prices)
+    w = p["winsor"]
+    win = [max(-w, min(w, d)) for d in diffs]
+    if not win:
+        return p["sigma_floor"]
+    mode = p.get("vol_mode", "rms")
+    floor = p["sigma_floor"]
+    cap = p["sigma_cap"]
+    if mode == "meanabs":
+        raw = _sigma_meanabs(win, p)
+        return min(max(raw, floor), cap) * p.get("meanabs_scale", 1.0)
+    if mode == "blend":
+        bw = p.get("vol_blend_w", 0.5)
+        rms = min(max(_sigma_rms(win, p), floor), cap) * p["sigma_scale"]
+        mab = min(max(_sigma_meanabs(win, p), floor), cap) * p.get("meanabs_scale", 1.0)
+        return (1.0 - bw) * rms + bw * mab
+    raw = _sigma_rms(win, p)
+    return min(max(raw, floor), cap) * p["sigma_scale"]
 
 
 def _stale_run(prices):
@@ -176,12 +183,18 @@ def forecast_case(case, p=None):
     # Per-market vol, staleness and activity counts (computed once).
     sig = []
     changes = []
+    stale = []
     for m in markets:
         prices = m["prices"]
         d = _diffs(prices)
         s = _sigma(prices, p)
-        if _stale_run(prices) >= p["stale_minutes"]:
+        is_stale = _stale_run(prices) >= p["stale_minutes"]
+        if is_stale:
             s *= p["stale_mult"]
+        stale.append(is_stale)
+        aw = p.get("active_window")
+        if aw is not None:
+            d = d[-aw:] if len(d) > aw else d
         changes.append(sum(1 for v in d if v != 0))
         sig.append(s)
     # Activity tier: top tertile by change count gets the widening.
@@ -189,19 +202,31 @@ def forecast_case(case, p=None):
     n_top = (n + 2) // 3  # ceil(n/3)
     active = set(order[n - n_top:])
     for i in active:
+        if p.get("stale_blocks_active") and stale[i]:
+            continue
         sig[i] *= p["active_mult"]
 
     out = []
     for i, m in enumerate(markets):
         x = last[i]
         target = x / total if total > 0 else x
+        gap = abs(target - x)
+        tau_eff = p["tau"]
+        if p.get("tau_gap_k", 0.0):
+            tau_eff = p["tau"] / (1.0 + p["tau_gap_k"] * gap)
         rows = []
+        sk = p.get("glide_skew", 0.0)
+        direction = 1.0 if target > x else (-1.0 if target < x else 0.0)
         for h in range(1, horizon + 1):
-            glide = 1.0 - math.exp(-h / p["tau"])
+            glide = 1.0 - math.exp(-h / tau_eff)
             centre = x + glide * (target - x)
             mult = _bucket_mult(h, p) * sig[i] * math.sqrt(h)
-            row = [price6(centre + mult * Z[j] + p["offsets"][j])
-                   for j in range(5)]
+            row = []
+            for j in range(5):
+                zj = Z[j]
+                if sk and zj != 0.0:
+                    zj = zj * (1.0 + sk * direction * (1.0 if zj > 0 else -1.0))
+                row.append(price6(centre + mult * zj + p["offsets"][j]))
             for j in range(1, 5):  # enforce non-decreasing quantiles
                 if row[j] < row[j - 1]:
                     row[j] = row[j - 1]
