@@ -1,30 +1,87 @@
-# Polymarket "Next CEO of NVIDIA?" forecaster (make.fun polymarket-nvidia-ceo-forecast-01).
+# Polymarket "Next CEO of NVIDIA?" forecaster v3 (make.fun polymarket-nvidia-ceo-forecast-01).
 #
-# Design: empirical-quantile fan with recency-weighted windows.
+# v3 rebuilds the entry on the top-10 reference architecture (a friend's
+# grind, shared with us as a design reference -- prose only, this code is
+# written from scratch here): a normal fan around a sum-reverting median,
+# with per-market realised volatility, horizon-bucket calibration, a
+# staleness shrink and an activity-tier widening, plus a skew correction
+# on the upper-middle quantile.
 #
-# For each market, the trailing 720 minutes of 1-minute prices give the
-# empirical distribution of price changes over h minutes, at anchor
-# horizons [1, 5, 15, 30, 60, 120, 240]. Windows are weighted by recency
-# (half-life 120 minutes: a market that just jumped is treated as hot,
-# one that jumped hours ago is mostly forgotten). The forecast quantile
-# at level tau and horizon h is
-#     q_tau(h) = x + spread_tau(h),
-# where x is the market's price at the checkpoint (persistence median)
-# and spread_tau(h) is the empirical tau-quantile of h-minute changes
-# minus its empirical median (so the fan's shape is the market's own:
-# asymmetric, heavy-tailed), log-interpolated in h between anchors,
-# scaled by 0.7, with a floor on the outer spreads so even a quiet
-# market keeps some jump insurance.
+# Design (all constants below are the reference v6 values):
 #
-# Why this shape: a uniform fan (the house baseline, sigma 0.0025) is far
-# too wide for the quiet markets (most move ~0 in 4 hours) and far too
-# narrow for the jumpy ones; per-market empirical quantiles fix both.
-# Practice pinball loss 0.2857 vs the house baseline's 0.3636 (beats it on
-# all six practice cases; the dev board's best is 0.256). Practice pays
-# nothing and is no guide to the final, so the design is kept simple and
-# robust rather than tuned to the last decimal: no drift, no trend, no
-# cross-market normalisation (the sum of Yes prices wanders 0.81-1.09,
-# so forcing it to a target does not help).
+# 1. MEDIAN = persistence + sum-reversion. The 24 candidates are mutually
+#    exclusive, so the Yes prices should sum to ~1; each market's median
+#    glides toward its normalised share x_i/S (S = sum of the last prices
+#    of all markets in the case):
+#        centre_i(h) = x_i + (1 - exp(-h/TAU)) * (x_i/S - x_i),  TAU = 180
+#    The glide applies to the WHOLE fan (every quantile is centred on
+#    centre_i(h)), not to the median alone.
+#
+# 2. SIGMA = realised vol per market, from 1-minute diffs. Diffs are
+#    winsorised at +-0.05, then the root-mean-square over trailing windows
+#    of 120 / 360 / 1440 minutes is blended 0.4 / 0.4 / 0.2. The blend is
+#    floored at 0.0002 and capped at 0.012, then scaled by 0.47 (see the
+#    "WHAT SHIPPED" note below for why). Fan half-width at horizon h:
+#        width_j(h) = z_j * sigma * sqrt(h)          (z = normal quantiles)
+#
+# 3. HORIZON BUCKETS multiply the fan width: 1.0 for h 1-30, 0.85 for
+#    h 31-120, 0.85 for h 121-240. The fan is too wide at long horizons;
+#    short horizons stay full because jumps live there.
+#
+# 4. STALENESS: a market whose last price has not changed for >=120
+#    minutes gets sigma x 0.5 (a dead market stays dead).
+#
+# 5. ACTIVITY TIER: the top tertile of markets by number of price changes
+#    within the case gets sigma x 1.15. Active markets' moves cluster and
+#    persist, so the fan is too narrow for them, not too wide.
+#
+# 6. QUANTILE OFFSETS (additive, after the width): (q05, q25, q50, q75,
+#    q95) = (0, 0, 0, -0.04, +0.005). Realised prices skew below the fan
+#    (q75 coverage was 0.841 vs 0.75 nominal), so the skew correction sits
+#    on q75 -- NOT on the median (a median offset was rejected outright;
+#    the centre is already right).
+#
+# Reference v6 practice loss (their true grader, same numbers as ours):
+# mean 0.252411 (p00 0.384117, p01 0.301470, p02 0.333913, p03 0.254442,
+# p04 0.189746, p05 0.105501; median error 0.748344, coverage90 0.913184).
+# Our v1 (empirical fan, persistence median) is 0.285720 and our v2
+# (empirical fan + price kernel + pooled blend) is 0.275400 on the same
+# grader; this v3 is a different family, not a tweak of either.
+#
+# WHAT SHIPPED (this file) vs the reference v6 -- two changes, both
+# measured on our grader and validated out-of-sample (see GRIND-V3.md):
+#
+# (a) SIGMA ESTIMATOR + CALIBRATION. The reference's prose says "realised
+#     vol from 1-minute diffs" without naming the estimator. My first build
+#     used RMS and landed at 0.290782 with cov90 0.9843 (fan far too wide)
+#     while the median error matched the reference EXACTLY (0.748344), so
+#     the centre was right and only the fan scale was wrong. Diagnosis: for
+#     this steppy series RMS is dominated by rare jumps. Switching sigma to
+#     the mean-absolute-diff estimator (normal-consistent, sqrt(pi/2)*E|d|)
+#     reproduces the reference v6 almost exactly: 0.252634 (per-case within
+#     0.0023, p04/p05/med_err exact). The SHIPPED estimator is RMS with a
+#     global 0.47 calibration instead: practice 0.248893, and it ALSO wins
+#     on 27 unseen pseudo-cases (0.933348 vs base 0.964917) and on the 15
+#     final-like Nov-12 checkpoints (0.381742 vs 0.387870), with a positive
+#     leave-one-out margin on every 5-case subset. The 0.47 sits mid-valley
+#     (practice 0.2488 at 0.45, 0.2489 at 0.47, 0.2490 at 0.48, 0.2494 at
+#     0.50 -- flat), not at a sharp argmin.
+# (b) SIGMA FLOOR 0.0002 instead of 0.0004 (OAT winner, 4/6 cases, and the
+#     0.0002-0.0003 valley is flat; 0.0008 is much worse).
+# Everything else is the reference v6 unchanged (tau 180, buckets,
+# staleness, activity tier, offsets).
+#
+# TESTED AND REJECTED on this family (details in GRIND-V3.md): pooled-sigma
+# blend for short-history markets (practice +0.007, rejected); price-kernel
+# sigma bw 0.075/0.10 (pseudo worse); tau 120 (practice -0.0005 but pseudo
+# +0.049 -- a practice mirage, rejected); sigma cap 0.008 (practice gain
+# concentrated in p03 alone, 1/6 wins; on the RMS champion it HURTS);
+# winsor 0.08; bucket (1.0, 0.85, 0.75); q75 offsets -0.02/-0.03/-0.05/-0.06;
+# q95 offset 0/+0.01; stale 0.4/0.6/off and thresholds 60/180; active
+# 1.0/1.10/1.25; window-weight blends. The reference's own rejected levers
+# (sub-diffusive beta, symmetric tail inflation, logit space, drift/momentum,
+# bounce-reversal, jump-filtered sigma, burst window, per-quantile exponents)
+# were NOT re-tested, per the reference.
 #
 # Pure Python 3.13 standard library, deterministic, offline.
 # Reads every <id>.in in the input directory (MAKEFUN_INPUT_DIR or /input)
@@ -40,12 +97,23 @@ INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
 OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 
 QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95]
-ANCHORS = [1, 5, 15, 30, 60, 120, 240]
+# Standard-normal quantiles for QUANTILES (rounded to 9 dp; symmetric).
+Z = [-1.644853627, -0.67448975, 0.0, 0.67448975, 1.644853627]
 
-LOOKBACK = 720        # minutes of trailing history per market
-HALF_LIFE = 120.0     # recency half-life (minutes) for window weights
-SPREAD_SCALE = 0.7    # shrink on the empirical spreads
-SPREAD_FLOOR = 0.02   # min |outer spread| at h=240 (scales as sqrt(h/240))
+# --- reference v6 parameters (tunable via PARAMS for experiments) ---
+PARAMS = {
+    "tau": 180.0,            # sum-reversion glide time constant (minutes)
+    "win_weights": ((120, 0.4), (360, 0.4), (1440, 0.2)),  # vol windows
+    "winsor": 0.05,          # per-diff winsor cap
+    "sigma_floor": 0.0002,
+    "sigma_cap": 0.012,
+    "buckets": ((30, 1.0), (120, 0.85), (240, 0.85)),  # (h_max, mult)
+    "stale_minutes": 120,    # unchanged-price run that counts as stale
+    "stale_mult": 0.5,
+    "active_mult": 1.15,     # top-tertile activity widening
+    "offsets": (0.0, 0.0, 0.0, -0.04, 0.005),
+    "sigma_scale": 0.47,     # global calibration on sigma (see header note)
+}
 
 
 def price6(x):
@@ -53,85 +121,93 @@ def price6(x):
     return round(min(1.0, max(0.0, x)) * 1e6) / 1e6 + 0.0
 
 
-def _weighted_quantile(pairs, p):
-    """Quantile of (value, weight) pairs, sorted by value."""
-    pairs = sorted(pairs)
-    total = sum(w for _, w in pairs)
-    if total <= 0:
-        return 0.0
-    acc = 0.0
-    for v, w in pairs:
-        acc += w
-        if acc >= p * total:
-            return v
-    return pairs[-1][0]
+def _diffs(prices):
+    """1-minute diffs of a price series."""
+    return [prices[i + 1] - prices[i] for i in range(len(prices) - 1)]
 
 
-def market_spreads(prices):
-    """Per-anchor empirical quantile spreads of h-minute changes.
-
-    Returns {anchor_h: [s05, s25, s50, s75, s95]} where each spread is the
-    recency-weighted empirical tau-quantile of the h-minute change minus
-    its weighted median, scaled by SPREAD_SCALE. Centring on the median
-    (rather than on zero) keeps the fan's shape while the forecast median
-    itself stays at the checkpoint price.
+def _sigma(prices, p):
+    """Blended realised vol: RMS of winsorised 1-minute diffs over trailing
+    windows of 120 / 360 / 1440 minutes, blended 0.4 / 0.4 / 0.2, floored
+    at sigma_floor and capped at sigma_cap, then scaled by sigma_scale.
     """
-    window = prices[-LOOKBACK:] if len(prices) > LOOKBACK else prices
-    out = {}
-    for h in ANCHORS:
-        n_win = len(window) - h
-        if n_win <= 0:
-            out[h] = [0.0] * 5
-            continue
-        pairs = []
-        for i in range(n_win):
-            age = n_win - 1 - i  # minutes from this window's start to the last
-            pairs.append((window[i + h] - window[i], 0.5 ** (age / HALF_LIFE)))
-        med = _weighted_quantile(pairs, 0.5)
-        out[h] = [(_weighted_quantile(pairs, t) - med) * SPREAD_SCALE for t in QUANTILES]
-    return out
+    diffs = _diffs(prices)
+    w = p["winsor"]
+    win = [max(-w, min(w, d)) for d in diffs]
+    if not win:
+        return p["sigma_floor"]
+    sig = 0.0
+    for minutes, weight in p["win_weights"]:
+        seg = win[-minutes:] if len(win) > minutes else win
+        n = len(seg)
+        var = sum(d * d for d in seg) / n
+        sig += weight * math.sqrt(var)
+    return min(max(sig, p["sigma_floor"]), p["sigma_cap"]) * p["sigma_scale"]
 
 
-def _interp_spreads(spreads, h):
-    """Log-linear interpolation of the five spreads at horizon h."""
-    if h <= ANCHORS[0]:
-        return spreads[ANCHORS[0]]
-    if h >= ANCHORS[-1]:
-        return spreads[ANCHORS[-1]]
-    for a, b in zip(ANCHORS, ANCHORS[1:]):
-        if a <= h <= b:
-            f = (math.log(h) - math.log(a)) / (math.log(b) - math.log(a))
-            sa, sb = spreads[a], spreads[b]
-            return [sa[j] + f * (sb[j] - sa[j]) for j in range(5)]
-    return spreads[ANCHORS[-1]]
-
-
-def forecast_market(prices, horizon):
-    """240 rows x 5 quantiles for one market, median at the checkpoint price."""
+def _stale_run(prices):
+    """Length (in minutes) the last price has been unchanged."""
     x = prices[-1]
-    spreads = market_spreads(prices)
-    rows = []
-    for h in range(1, horizon + 1):
-        sp = _interp_spreads(spreads, h)
-        fl = SPREAD_FLOOR * math.sqrt(h / 240.0)
-        if abs(sp[0]) < fl:
-            sp[0] = -fl
-        if abs(sp[4]) < fl:
-            sp[4] = fl
-        row = [price6(x + sp[j]) for j in range(5)]
-        for j in range(1, 5):
-            if row[j] < row[j - 1]:
-                row[j] = row[j - 1]
-        rows.append(row)
-    return rows
+    run = 0
+    for v in reversed(prices):
+        if v != x:
+            break
+        run += 1
+    return run - 1  # k equal prices span k-1 minute gaps
 
 
-def forecast_case(case):
+def _bucket_mult(h, p):
+    """Horizon-bucket width multiplier for horizon h (1-based)."""
+    for h_max, mult in p["buckets"]:
+        if h <= h_max:
+            return mult
+    return p["buckets"][-1][1]
+
+
+def forecast_case(case, p=None):
+    """Forecast one case: list of {"id": ..., "q": [[5 quantiles] x 240]}."""
+    p = PARAMS if p is None else p
     horizon = case["horizon_minutes"]
-    return [
-        {"id": m["id"], "q": forecast_market(m["prices"], horizon)}
-        for m in case["markets"]
-    ]
+    markets = case["markets"]
+    n = len(markets)
+    last = [m["prices"][-1] for m in markets]
+    total = sum(last)  # S: sum of the checkpoint prices
+
+    # Per-market vol, staleness and activity counts (computed once).
+    sig = []
+    changes = []
+    for m in markets:
+        prices = m["prices"]
+        d = _diffs(prices)
+        s = _sigma(prices, p)
+        if _stale_run(prices) >= p["stale_minutes"]:
+            s *= p["stale_mult"]
+        changes.append(sum(1 for v in d if v != 0))
+        sig.append(s)
+    # Activity tier: top tertile by change count gets the widening.
+    order = sorted(range(n), key=lambda i: changes[i])
+    n_top = (n + 2) // 3  # ceil(n/3)
+    active = set(order[n - n_top:])
+    for i in active:
+        sig[i] *= p["active_mult"]
+
+    out = []
+    for i, m in enumerate(markets):
+        x = last[i]
+        target = x / total if total > 0 else x
+        rows = []
+        for h in range(1, horizon + 1):
+            glide = 1.0 - math.exp(-h / p["tau"])
+            centre = x + glide * (target - x)
+            mult = _bucket_mult(h, p) * sig[i] * math.sqrt(h)
+            row = [price6(centre + mult * Z[j] + p["offsets"][j])
+                   for j in range(5)]
+            for j in range(1, 5):  # enforce non-decreasing quantiles
+                if row[j] < row[j - 1]:
+                    row[j] = row[j - 1]
+            rows.append(row)
+        out.append({"id": m["id"], "q": rows})
+    return out
 
 
 def main():
